@@ -7,7 +7,7 @@ Open `index.html` locally or host the repository as a static site.
 ## Gemini Artifacts
 
 - Current Gemini artifact: [gemini.google.com/share/457213c0b552](https://gemini.google.com/share/457213c0b552)
-- Original Gemini artifact by [@cammakingminds](https://github.com/cammakingminds): [gemini.google.com/share/8838217a650f](https://gemini.google.com/share/8838217a650f)
+- Original Gemini artifact from @cammakingminds: [gemini.google.com/share/8838217a650f](https://gemini.google.com/share/8838217a650f)
 
 ## Demos
 
