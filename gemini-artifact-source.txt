@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Bifurcation Locus Limit Object</title>
+    <style>
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000000;
+        }
+
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.umd.min.js"></script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <script>
+        const container = document.getElementById('canvas-container');
+
+        const params = {
+            numSlices: 320,
+            solveDepth: 8,
+            renderDepth: 12,
+            longitudinalStep: 16,
+            lengthScale: 145,
+            zSpacing: 3.3,
+            thetaStart: 0.15,
+            thetaSpread: 2.8,
+            locusLimit: 1.0,
+            curveType: 'Symmetric Tree',
+            opacity: 0.35,
+            opacityRatio: 0.15,
+            frontDepthGradient: 0.0,
+            scanSpeed: 0.002,
+            triggerScan: function() { triggerVisualScan(); }
+        };
+
+        let scene, camera, renderer, orbitControls;
+        let geometry, surfaceMesh, material;
+        let positions, colors, customSliceIndices;
+        let pIdx = 0, cIdx = 0, sIdx = 0;
+
+        let currentSlice = 0;
+        let currentBakeId = 0;
+        const slicesPerFrame = 8;
+        let lastPts = null;
+        let lastRc = 0.55;
+
+        let sweepState = "idle";
+        let sweepProgress = 0.0;
+        let scanAlpha = 0.0;
+        let isBakeFinished = false;
+
+        let pointerDownX = 0;
+        let pointerDownY = 0;
+        let pointerDownTime = 0;
+
+        const vertexShaderSource = `
+            uniform float uScanAlpha;
+            uniform float uScanSlice;
+            uniform float uScanWidth;
+            uniform float uDimWidth;
+            attribute vec3 customColor;
+            attribute float customSliceIndex;
+            varying vec3 vColor;
+
+            void main() {
+                vec3 baseColor = customColor;
+                float dist = abs(customSliceIndex - uScanSlice);
+
+                float x = dist / uScanWidth;
+                float wavePeak = exp(-x * x);
+
+                float y = dist / uDimWidth;
+                float dimValley = 1.0 - exp(-y * y);
+                float localDim = mix(0.12, 0.65, dimValley);
+                float targetMultiplier = localDim + 3.0 * wavePeak;
+                float finalMultiplier = mix(1.0, targetMultiplier, uScanAlpha);
+
+                float aheadMask = smoothstep(
+                    uScanSlice + uScanWidth * 0.5,
+                    uScanSlice + uScanWidth * 2.5,
+                    customSliceIndex
+                );
+                float visibility = mix(1.0, 1.0 - aheadMask, uScanAlpha);
+
+                vColor = baseColor * finalMultiplier * visibility;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        const fragmentShaderSource = `
+            uniform float uOpacity;
+            uniform float uPulse;
+            varying vec3 vColor;
+
+            void main() {
+                gl_FragColor = vec4(vColor * (1.0 + uPulse * 0.35), uOpacity);
+            }
+        `;
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.001);
+
+            camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 1, 10000);
+            camera.position.set(0, 180, 820);
+
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setPixelRatio(1.0);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            container.appendChild(renderer.domElement);
+
+            orbitControls = new THREE.OrbitControls(camera, renderer.domElement);
+            orbitControls.enableDamping = true;
+            orbitControls.dampingFactor = 0.05;
+            orbitControls.autoRotate = false;
+            orbitControls.maxPolarAngle = Math.PI * 0.85;
+            orbitControls.minDistance = 150;
+            orbitControls.maxDistance = 2500;
+
+            buildGeometry();
+            initGUI();
+
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('pointerup', onPointerUp);
+
+            requestAnimationFrame(() => progressiveBake(currentBakeId));
+            animate();
+        }
+
+        function buildGeometry() {
+            const N = Math.pow(2, params.renderDepth);
+            const totalTransversalSegments = params.numSlices * (N - 1);
+            const totalLongitudinalSegments = (params.numSlices - 1) * Math.floor(N / params.longitudinalStep);
+            const totalSegments = totalTransversalSegments + totalLongitudinalSegments;
+
+            positions = new Float32Array(totalSegments * 6);
+            colors = new Float32Array(totalSegments * 6);
+            customSliceIndices = new Float32Array(totalSegments * 2);
+
+            geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('customColor', new THREE.BufferAttribute(colors, 3));
+            geometry.setAttribute('customSliceIndex', new THREE.BufferAttribute(customSliceIndices, 1));
+            geometry.setDrawRange(0, 0);
+
+            material = new THREE.ShaderMaterial({
+                vertexShader: vertexShaderSource,
+                fragmentShader: fragmentShaderSource,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                uniforms: {
+                    uScanAlpha: { value: 0.0 },
+                    uScanSlice: { value: 0.0 },
+                    uScanWidth: { value: 2.0 },
+                    uDimWidth: { value: 45.0 },
+                    uOpacity: { value: params.opacity },
+                    uPulse: { value: 0.0 }
+                }
+            });
+
+            surfaceMesh = new THREE.LineSegments(geometry, material);
+            scene.add(surfaceMesh);
+        }
+
+        function rebuild() {
+            currentBakeId++;
+            isBakeFinished = false;
+
+            if (surfaceMesh) {
+                scene.remove(surfaceMesh);
+            }
+            if (geometry) {
+                geometry.dispose();
+            }
+            if (material) {
+                material.dispose();
+            }
+
+            buildGeometry();
+
+            currentSlice = 0;
+            pIdx = 0;
+            cIdx = 0;
+            sIdx = 0;
+            lastPts = null;
+            lastRc = 0.55;
+            sweepState = "idle";
+            scanAlpha = 0.0;
+            sweepProgress = 0.0;
+
+            requestAnimationFrame(() => progressiveBake(currentBakeId));
+        }
+
+        function initGUI() {
+            const gui = new lil.GUI({ title: 'Bifurcation Parameters' });
+
+            const geomFolder = gui.addFolder('Latent Space & Locus');
+            geomFolder.add(params, 'curveType', [
+                'Symmetric Tree',
+                'Asymmetric Wind',
+                'Alternating Parity',
+                'Orthogonal Fold'
+            ]).name('Curve Type').onChange(rebuild);
+            geomFolder.add(params, 'thetaStart', 0.0, 3.14).name('Phase Start').onFinishChange(rebuild);
+            geomFolder.add(params, 'thetaSpread', 0.1, 6.28).name('Phase Spread').onFinishChange(rebuild);
+            geomFolder.add(params, 'locusLimit', 0.1, 3.0).name('Locus Limit').onFinishChange(rebuild);
+            geomFolder.add(params, 'solveDepth', 4, 12, 1).name('Solver Depth').onFinishChange(rebuild);
+
+            const renderFolder = gui.addFolder('Mesh & Rendering');
+            renderFolder.add(params, 'numSlices', 50, 600, 1).name('Slices').onFinishChange(rebuild);
+            renderFolder.add(params, 'renderDepth', 8, 14, 1).name('Resolution').onFinishChange(rebuild);
+            renderFolder.add(params, 'longitudinalStep', 4, 64, 1).name('Longitudinal Step').onFinishChange(rebuild);
+            renderFolder.add(params, 'lengthScale', 50, 300).name('Scale').onFinishChange(rebuild);
+            renderFolder.add(params, 'zSpacing', 0.5, 10.0).name('Z-Spacing').onFinishChange(rebuild);
+            renderFolder.add(params, 'opacityRatio', 0.01, 0.5, 0.01).name('Bg/Rib Ratio').onFinishChange(rebuild);
+            renderFolder.add(params, 'frontDepthGradient', 0.0, 1.0, 0.01).name('Front Depth Gradient').onFinishChange(rebuild);
+            renderFolder.add(params, 'opacity', 0.05, 1.0).name('Opacity').onChange(v => {
+                if (material) {
+                    material.uniforms.uOpacity.value = v;
+                }
+            });
+
+            const scanFolder = gui.addFolder('Scan');
+            scanFolder.add(params, 'scanSpeed', 0.0005, 0.01, 0.0001).name('Scan Speed');
+            scanFolder.add(params, 'triggerScan').name('Trigger Wave Scan');
+        }
+
+        function getBranchAngles(angle, theta, d, type) {
+            if (type === 'Symmetric Tree') {
+                return [angle - theta, angle + theta];
+            }
+            if (type === 'Asymmetric Wind') {
+                return [angle - theta * 0.4, angle + theta * 1.4];
+            }
+            if (type === 'Alternating Parity') {
+                const sign = (d % 2 === 0) ? 1 : -1;
+                return [angle - theta * sign, angle + theta * sign];
+            }
+            if (type === 'Orthogonal Fold') {
+                return [angle - Math.PI / 2 + theta, angle + Math.PI / 2 - theta];
+            }
+            return [angle - theta, angle + theta];
+        }
+
+        function getMaxX(r, theta, depth) {
+            let bestX = -Infinity;
+            const maxReachFactor = (r / (1 - r)) * params.locusLimit;
+
+            function dfs(x, angle, scale, d) {
+                const maxReach = scale * maxReachFactor;
+                if (x + maxReach <= bestX) {
+                    return;
+                }
+
+                if (d === 0) {
+                    if (x > bestX) {
+                        bestX = x;
+                    }
+                    return;
+                }
+
+                if (x > bestX) {
+                    bestX = x;
+                }
+
+                const rS = scale * r;
+                const [angleL, angleR] = getBranchAngles(angle, theta, d, params.curveType);
+                dfs(x + rS * Math.sin(angleL), angleL, rS, d - 1);
+                dfs(x + rS * Math.sin(angleR), angleR, rS, d - 1);
+            }
+
+            const initialAngles = getBranchAngles(0, theta, depth, params.curveType);
+            dfs(r * Math.sin(initialAngles[0]), initialAngles[0], r, depth);
+            return bestX;
+        }
+
+        function solveRc(theta, depth) {
+            let low = Math.max(0.35, lastRc - 0.08);
+            let high = Math.min(0.95, lastRc + 0.08);
+
+            for (let i = 0; i < 8; i++) {
+                const mid = (low + high) / 2;
+                if (getMaxX(mid, theta, depth) > 0) {
+                    high = mid;
+                } else {
+                    low = mid;
+                }
+            }
+
+            lastRc = (low + high) / 2;
+            return lastRc;
+        }
+
+        function getEndpoints(theta, r, depth) {
+            const pts = new Float32Array(Math.pow(2, depth) * 2);
+            let idx = 0;
+
+            function recurse(x, y, angle, scale, d) {
+                if (d === 0) {
+                    pts[idx++] = x;
+                    pts[idx++] = y;
+                    return;
+                }
+
+                const rS = scale * r;
+                const [angleL, angleR] = getBranchAngles(angle, theta, d, params.curveType);
+                recurse(x + rS * Math.sin(angleL), y - rS * Math.cos(angleL), angleL, rS, d - 1);
+                recurse(x + rS * Math.sin(angleR), y - rS * Math.cos(angleR), angleR, rS, d - 1);
+            }
+
+            recurse(0, 0, 0, 1.0, depth);
+            return pts;
+        }
+
+        function onPointerDown(e) {
+            if (isGuiEvent(e)) {
+                return;
+            }
+            pointerDownX = e.clientX;
+            pointerDownY = e.clientY;
+            pointerDownTime = performance.now();
+        }
+
+        function onPointerUp(e) {
+            if (isGuiEvent(e)) {
+                return;
+            }
+
+            const moveThreshold = 6;
+            const timeThreshold = 300;
+            const deltaX = Math.abs(e.clientX - pointerDownX);
+            const deltaY = Math.abs(e.clientY - pointerDownY);
+            const deltaTime = performance.now() - pointerDownTime;
+
+            if (deltaX < moveThreshold && deltaY < moveThreshold && deltaTime < timeThreshold) {
+                triggerVisualScan();
+            }
+        }
+
+        function isGuiEvent(e) {
+            return e.target && e.target.closest && e.target.closest('.lil-gui');
+        }
+
+        function triggerVisualScan() {
+            if (!isBakeFinished || sweepState !== "idle") {
+                return;
+            }
+            sweepState = "transitionIn";
+            sweepProgress = 0.0;
+            scanAlpha = 0.0;
+        }
+
+        function getSliceMultiplier(j, numSlices) {
+            const isLastSlice = (j === numSlices - 1);
+            const step = numSlices / 8;
+            let isIntermediary = false;
+
+            for (let i = 1; i < 8; i++) {
+                if (Math.abs(j - Math.round(i * step)) < 0.5) {
+                    isIntermediary = true;
+                    break;
+                }
+            }
+
+            if (isLastSlice) {
+                return 4.0;
+            }
+            if (isIntermediary) {
+                return 3.0;
+            }
+            return params.opacityRatio;
+        }
+
+        function getDepthGradientFactor(t, minBrightness, exponent) {
+            const gradient = minBrightness + (1.0 - minBrightness) * Math.pow(t, exponent);
+            return 1.0 - params.frontDepthGradient + params.frontDepthGradient * gradient;
+        }
+
+        function progressiveBake(bakeId) {
+            if (bakeId !== currentBakeId) {
+                return;
+            }
+
+            if (currentSlice < params.numSlices) {
+                const limit = Math.min(currentSlice + slicesPerFrame, params.numSlices);
+                const N = Math.pow(2, params.renderDepth);
+
+                for (let j = currentSlice; j < limit; j++) {
+                    let theta = params.thetaStart + (j / (params.numSlices - 1)) * params.thetaSpread;
+                    const epsilon = 0.12;
+                    const closestPiMultiplier = Math.round(theta / Math.PI);
+                    const offsetFromPi = theta - closestPiMultiplier * Math.PI;
+
+                    if (Math.abs(offsetFromPi) < epsilon) {
+                        theta = closestPiMultiplier * Math.PI + epsilon * Math.sign(offsetFromPi || 1);
+                    }
+
+                    const rc = solveRc(theta, params.solveDepth);
+                    const pts = getEndpoints(theta, rc, params.renderDepth);
+                    const z = (j - params.numSlices / 2) * params.zSpacing;
+                    const opacityMultiplier = getSliceMultiplier(j, params.numSlices);
+                    const temporalFactor = getDepthGradientFactor(j / (params.numSlices - 1), 0.04, 1.8);
+
+                    for (let k = 0; k < (N - 1) * 2; k += 2) {
+                        const x1 = pts[k] * params.lengthScale;
+                        const y1 = (-pts[k + 1] + 1.0) * params.lengthScale;
+                        const x2 = pts[k + 2] * params.lengthScale;
+                        const y2 = (-pts[k + 3] + 1.0) * params.lengthScale;
+
+                        positions[pIdx++] = x1; positions[pIdx++] = y1; positions[pIdx++] = z;
+                        positions[pIdx++] = x2; positions[pIdx++] = y2; positions[pIdx++] = z;
+
+                        const factor = Math.abs((k / 2) - (N / 2)) / (N / 2);
+                        const baseBrightness = 0.015 + 0.18 * (1.0 - Math.pow(factor, 2));
+                        const brightness = baseBrightness * temporalFactor * opacityMultiplier;
+
+                        colors[cIdx++] = brightness; colors[cIdx++] = brightness; colors[cIdx++] = brightness;
+                        colors[cIdx++] = brightness; colors[cIdx++] = brightness; colors[cIdx++] = brightness;
+
+                        customSliceIndices[sIdx++] = j;
+                        customSliceIndices[sIdx++] = j;
+                    }
+
+                    if (lastPts) {
+                        const lastZ = (j - 1 - params.numSlices / 2) * params.zSpacing;
+
+                        for (let k = 0; k < N; k += params.longitudinalStep) {
+                            const kIdx = k * 2;
+                            const x1 = lastPts[kIdx] * params.lengthScale;
+                            const y1 = (-lastPts[kIdx + 1] + 1.0) * params.lengthScale;
+                            const x2 = pts[kIdx] * params.lengthScale;
+                            const y2 = (-pts[kIdx + 1] + 1.0) * params.lengthScale;
+
+                            positions[pIdx++] = x1; positions[pIdx++] = y1; positions[pIdx++] = lastZ;
+                            positions[pIdx++] = x2; positions[pIdx++] = y2; positions[pIdx++] = z;
+
+                            const tAvg = (j - 0.5) / (params.numSlices - 1);
+                            const gridTemporalFactor = getDepthGradientFactor(tAvg, 0.02, 1.8);
+                            const factor = Math.abs(k - (N / 2)) / (N / 2);
+                            const baseBrightness = 0.005 + 0.07 * (1.0 - Math.pow(factor, 3));
+                            const brightness = baseBrightness * gridTemporalFactor * opacityMultiplier;
+
+                            colors[cIdx++] = brightness; colors[cIdx++] = brightness; colors[cIdx++] = brightness;
+                            colors[cIdx++] = brightness; colors[cIdx++] = brightness; colors[cIdx++] = brightness;
+
+                            customSliceIndices[sIdx++] = j - 1;
+                            customSliceIndices[sIdx++] = j;
+                        }
+                    }
+
+                    lastPts = pts;
+                }
+
+                currentSlice = limit;
+                geometry.attributes.position.needsUpdate = true;
+                geometry.attributes.customColor.needsUpdate = true;
+                geometry.attributes.customSliceIndex.needsUpdate = true;
+
+                const currentSegments = (
+                    currentSlice * (N - 1)
+                ) + (
+                    Math.max(0, currentSlice - 1) * Math.floor(N / params.longitudinalStep)
+                );
+                geometry.setDrawRange(0, currentSegments * 2);
+
+                requestAnimationFrame(() => progressiveBake(bakeId));
+            } else {
+                isBakeFinished = true;
+            }
+        }
+
+        function updateScanTimeline() {
+            if (sweepState === "transitionIn") {
+                scanAlpha += 0.02;
+                if (scanAlpha >= 1.0) {
+                    scanAlpha = 1.0;
+                    sweepState = "scanning";
+                }
+            } else if (sweepState === "scanning") {
+                sweepProgress += params.numSlices * params.scanSpeed;
+                if (sweepProgress >= params.numSlices) {
+                    sweepProgress = params.numSlices;
+                    sweepState = "transitionOut";
+                }
+            } else if (sweepState === "transitionOut") {
+                scanAlpha -= 0.02;
+                if (scanAlpha <= 0.0) {
+                    scanAlpha = 0.0;
+                    sweepProgress = 0.0;
+                    sweepState = "idle";
+                }
+            }
+
+            if (material) {
+                const pulseTime = performance.now() * 0.003;
+                material.uniforms.uPulse.value = sweepState === "idle" ? Math.sin(pulseTime) * 0.5 + 0.5 : 0.0;
+                material.uniforms.uScanAlpha.value = scanAlpha;
+                material.uniforms.uScanSlice.value = sweepProgress;
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (isBakeFinished) {
+                updateScanTimeline();
+            }
+
+            orbitControls.update();
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
